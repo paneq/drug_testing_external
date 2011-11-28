@@ -1,0 +1,446 @@
+Testing communication with external systems using EventMaching or Ruby on Rails
+===============================================================================
+:author:    Robert Pankowecki
+:copyright: Robert Pankowecki
+:backend:   slidy
+:max-width: 45em
+:data-uri:
+:icons:
+:language: ruby
+:pygments:
+
+
+Robert Pankowecki ???
+---------------------
+
+image:/home/rupert/Dropbox/drug/wroclawrb/logos/drug-logo-name-rect-sq.png[]
+image:/home/rupert/Dropbox/drug/wroclawrb/krasnal.png[]
+image:/home/rupert/Dropbox/drug/arkency.png[]
+image:/home/rupert/Dropbox/Photos/rupert_outside_bw.jpeg[]
+
+* github:  @paneq
+* twitter: @pankowecki
+* gtalk:   robert.pankowecki
+* cv:      robert.pankowecki.pl
+* blog:    blog.robert.pankowecki.pl
+* company: rails.arkency.com
+* conference: wrocloverb.com
+
+
+Standalone applications?
+------------------------
+
+Really?
+
+
+External services
+-----------------
+
+* facebook
+* twitter
+* apns
+* bbps
+* sms
+* paypal
+* platnosci.pl
+
+
+Possible solutions
+------------------
+
+[role="incremental"]
+- no testing at all ?
+- library has test mode
+- adapter (production/test)
+- external system can have test mode
+- mocking web requests
+- Surprise!
+
+
+Possible solutions[No Testing]
+------------------------------
+
+image:/home/rupert/Dropbox/drug/no_testing.png[]
+
+
+Possible solutions[library has test mode]
+-----------------------------------------
+
+image:/home/rupert/Dropbox/drug/library_test.png[]
+
+* Are we testing production code?
+
+
+Possible solutions[adapter approach]
+------------------------------------
+
+image:/home/rupert/Dropbox/drug/adapter_approach.png[]
+
+* Are we testing production code?
+
+
+Mem
+---
+
+image:/home/rupert/Dropbox/drug/i_do_adapter.jpg[]
+
+
+Possible solutions[mocking web requests]
+----------------------------------------
+
+image:/home/rupert/Dropbox/drug/mocking.png[]
+
+* What if we split our application into 2 processes ?
+
+
+Possible solutions[external system test mode]
+---------------------------------------------
+
+image:/home/rupert/Dropbox/drug/external_system_test.png[]
+
+[role="incremental"]
+* FB
+* Some CC processors
+* Can be slow
+* Unreliable (not internet connection, external system downtime)
+* Might not be able to reproduce some real system behavior
+
+
+Possible solutions[Custom actor]
+--------------------------------
+
+image:/home/rupert/Dropbox/drug/test_actor.png[]
+
+* Fast
+* We can reproduce behaviors noted on productions
+* Not actually comunicating with external system
+
+
+
+[EM] Test Actors playing External System in Event Machine
+---------------------------------------------------------
+
+* External System (aka Base class)
+* Observer
+* Message
+* Connection (in EM terminology) [actual external system api logic]
+
+
+[EM] ExternalSystem
+-------------------
+
+[source]
+---------------------------------------------------------------------------------
+require 'evma_httpserver'
+
+class ExternalSystem < TestActor
+
+  def initialize(*args)
+    @messages = []
+    EM.start_server("0.0.0.0", port, system, @env.server_options) do |c|
+      c.messages = @messages
+      after_initialize(c)
+    end
+  end
+ 
+  def after_initialize(system_instance)
+  end
+
+  def received?(options = {}, &block)
+    message = fetch_message(options[:timeout])
+    yield message if block_given?
+    message
+  end
+
+  def receive_message!(options = {}, &block)
+    msg = received?(options)
+    env.assert_not_nil msg
+    yield msg if block_given?
+    msg
+  end
+
+  protected
+
+  def fetch_message(timeout = nil)
+    timeout ||= @default_timeout
+    f, message = Fiber.current, Observer.new(@messages, timeout)
+    message.callback { |msg| f.resume(msg) }
+    message.errback  { f.resume(nil) }
+    return Fiber.yield
+  end
+
+  def system; raise NotImplementedError; end
+  def port;   raise NotImplementedError; end
+end
+---------------------------------------------------------------------------------
+
+
+
+[EM] Observer
+-------------
+[source]
+---------------------------------------------------------------------------------
+class Observer
+  include EM::Deferrable
+
+  def initialize(messages, observe_timeout)
+    timeout(observe_timeout)
+
+    @messages    = messages
+    @shift_timer = EM.add_periodic_timer(0.001) { shift_message }
+
+    self.callback { EM.cancel_timer(@shift_timer) }
+    self.errback  { EM.cancel_timer(@shift_timer) }
+  end
+
+  def shift_message
+    if msg = @messages.shift
+      succeed(msg)
+    end
+  end
+end
+---------------------------------------------------------------------------------
+
+
+[EM] TestBulkSms
+----------------
+[source]
+---------------------------------------------------------------------------------
+class TestBulkSms < ExternalSystem
+  def system; Connection; end
+  def port; 2198; end
+
+  class Connection < EM::Connection
+    include EM::HttpServer
+
+    attr_accessor :messages
+
+    def process_http_request
+      response = EM::DelegatedHttpResponse.new(self)
+      response.status = 200
+      response.content_type 'text/html'
+      response.content = case @http_path_info
+        when "/eapi/submission/send_sms/2/2.0"    then "0|In progress"
+        end
+      response.send_response
+      @messages << Message.new(@http_post_content)
+    end
+  end
+end
+---------------------------------------------------------------------------------
+
+
+[EM] Message
+------------
+[source]
+---------------------------------------------------------------------------------
+class Message
+  attr_accessor :number, :message, :user, :password
+  private :number=, :message=, :user=, :password=
+
+  def initialize(content)
+    hash = ActiveSupport::HashWithIndifferentAccess.new(
+      CGI.parse(content).tap{|h| h.each{|k,v| h[k]= v.first }}
+    )
+    self.number =   hash[:msisdn]
+    self.message =  hash[:message]
+    self.user =     hash[:username]
+    self.password = hash[:password]
+  end
+end
+---------------------------------------------------------------------------------
+
+[EM] test scenario
+------------------
+[source]
+---------------------------------------------------------------------------------
+class PrivateMessagesFeature < SecretProject::TestCase
+
+  def test_private_message_push
+    alice = TestUser.new("alice")
+    bob   = TestUser.new("bob")
+    apns  = TestAPNS.new(self)
+
+    alice.send_private_message("hello", recipient: bob)
+ 
+    apns.receive_notification! do |notification|
+      assert_equal "New message from Alice", notification.alert
+      assert_equal 1, notification.badge
+    end
+  end
+
+end
+---------------------------------------------------------------------------------
+
+[EM] Summary
+------------
+
+* obvious
+* reliable (test code, external code, or application code running)
+
+
+
+
+[Rails] Test Actors playing External System in Ruby on Rails
+------------------------------------------------------------
+
+* External System (aka Base class)
+* Observer
+* Message
+* Servlet (in Webrick/Java terminology) [actual external system api logic]
+
+
+[Rails] Test scenario
+---------------------
+[source]
+---------------------------------------------------------------------------------
+class CreditCardProcessingFeature < TopSecretSystem::TestCase
+
+  def test_sends_data_to_cc
+    extend Test::Unit::Assertions
+
+    es = ExternalSystem.new(Servlet)
+
+    # Pretend user clicking our webpage triggered
+    # some event trying to communicate with external
+    # web system processing credit cards
+    Nestful.get 'http://localhost:1234?amount=123.45&card=111122223333444'
+
+    es.receive_message! do |m|
+      m.visa!
+      assert_equal 123.45, m.amount
+    end
+
+    es.stop
+  end
+
+end
+---------------------------------------------------------------------------------
+
+
+[Rails] External System
+-----------------------
+[source]
+---------------------------------------------------------------------------------
+class ExternalSystem
+
+  def initialize(servlet)
+    messages = @messages = []
+    mutex = @mutex = Mutex.new
+
+    @thread = Thread.new do
+      @server = WEBrick::HTTPServer.new(:Port => 1234)
+      @server.mount "/", servlet, @mutex, @messages
+      @server.start      
+    end
+  end
+
+  def stop
+    @thread.exit
+  end
+
+  def received?(options ={}, &block)
+    message = fetch_message(options[:timeout])
+    yield message if block_given?
+    message
+  end
+
+  def receive_message!(options = {}, &block)
+    message = received?(options)
+    assert_not_nil message
+    yield message if block_given?
+    message
+  end
+
+  def fetch_message(timeout = 5)
+    o = Observer.new(@messages, @mutex, timeout)
+    o.message
+  end
+
+end
+---------------------------------------------------------------------------------
+
+
+[Rails] Observer
+----------------
+[source]
+---------------------------------------------------------------------------------
+class Observer
+
+  def initialize(collection, mutex, timeout)
+    @collection = collection
+    @mutex = mutex
+    @timeout = timeout
+  end
+
+  def message
+    Timeout.timeout(@timeout) do
+      while true
+        @mutex.synchronize do
+          msg = @collection.shift
+          return msg if msg
+        end
+        sleep 0.3
+      end
+    end
+  rescue Timeout::Error
+    return nil
+  end
+
+end
+---------------------------------------------------------------------------------
+
+[Rails] Servlet
+---------------
+[source]
+---------------------------------------------------------------------------------
+class Servlet < ::WEBrick::HTTPServlet::AbstractServlet
+
+    def initialize(server, mutex, messages)
+      super(server)
+      @messages = messages
+      @mutex = mutex
+    end
+
+    def do_GET(request, response)
+      @mutex.synchronize do
+        hash = ActiveSupport::HashWithIndifferentAccess[ 
+          CGI.parse(request.query_string).map{|k,v| [k,v.first] } 
+        ]
+        @messages << Message.new(hash[:amount].to_f, hash[:card])
+      end
+      response.status = 200
+      response.content_type = "text/plain"
+      response.body = "You are trying to load #{request.path}"
+    end
+  end
+
+end
+---------------------------------------------------------------------------------
+
+
+[Rails] Message
+---------------
+[source]
+---------------------------------------------------------------------------------
+class Message < Struct.new(:amount, :credit_card)
+
+  include Test::Unit::Assertions
+   
+  def visa?
+    credit_card.to_s.starts_with?("1")
+  end
+
+  def visa!
+    assert visa?
+  end
+
+end
+---------------------------------------------------------------------------------
+
+
+[Rails] Summary
+---------------
+
+* more complicated
+* less reliable (maybe fiber version?)
